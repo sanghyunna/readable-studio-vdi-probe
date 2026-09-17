@@ -14,16 +14,31 @@ python test.py --endpoint system.ai.databricks-claude-sonnet-5 \
                --token <pat>
 ```
 
-`--selftest` runs offline and must print `SELFTEST PASSED` before you trust a run.
+`--selftest` runs offline with no credentials and must print `SELFTEST PASSED`
+before you trust a run. It exercises every classifier, every request-body
+builder and the result encoding.
 
-Optional: `--dump detail.json` keeps a full local transcript for your own reading,
-`--insecure` skips TLS verification behind a corporate proxy, `--verbose` shows
-progress, `--only A,C,E` restricts which paths are probed.
+Optional: `--dump detail.json` keeps a full local transcript for your own
+reading, `--insecure` skips TLS verification behind a corporate proxy,
+`--verbose` shows per-cell progress, `--only A,C,E` restricts paths.
 
 ## What to relay
 
-Only the final line. It starts with `V4#`.
-A line starting with `FAIL#` means the probe itself broke, not that the endpoint failed.
+Only the block printed under `RESULT CODE`. It is **uppercase letters**,
+grouped in fours, roughly 35-80 characters. Nothing else needs copying.
+
+```
+=== RESULT CODE (letters only - relay exactly this) ===
+IDXU VPUQ ZPLA ZAMB LPVZ ...
+```
+
+Two trailing check letters detect a mistyped character, so a bad copy is
+reported rather than silently misread. Spaces and lower case are ignored on
+decode. `python test.py --decode "<code>"` expands it back to the full matrix.
+
+A line reading `FAILCODE` means the probe itself broke - that is not a result.
+Inside the matrix, `X1`/`X2`/`X3` mark cells the script could not attempt.
+Script faults and findings are never mixed.
 
 ## What it decides
 
@@ -31,6 +46,9 @@ For each of eight candidate request paths it sends twenty single-variable
 requests: minimal, system prompt, three tool-envelope shapes, empty tools,
 three tool_choice modes, parallel-off, reasoning effort, alternate max-token
 field, streaming, stream options, two tools, strict schema, a tool-result round
-trip, anthropic_version, block-form system, and reasoning without tools.
-That isolates whether the rejection is the path, the tool envelope shape, a
-specific parameter, or the combination.
+trip, anthropic_version, block-form system, and reasoning without tools. It
+also records endpoint type, task, entity kind, AI Gateway presence and the
+declared supported APIs, plus any parameter name the server names as rejected.
+
+That isolates whether the rejection is the path, the tool envelope shape, one
+specific parameter, or the combination - in a single run.

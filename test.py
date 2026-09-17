@@ -462,15 +462,239 @@ def record(dump, phase, key, status, text):
     dump.append({"phase": phase, "key": key, "status": status, "body": (text or "")[:6000]})
 
 
+# ------------------------------------------------------------ digits-only code
+#
+# The relayed result is DIGITS ONLY, grouped in fives, with a check number.
+# Nothing else has to be copied. The readable table is printed to the screen
+# and stays on the machine.
+
+VOCAB = (
+    "-", "2", "N", "A", "R", "P", "5", "T", "?",
+    "4t", "4c", "4p", "4r", "4m", "4s", "4n", "4j", "4b", "4v", "4o",
+    "X1", "X2", "X3",
+)
+VOCAB_INDEX = {value: index for index, value in enumerate(VOCAB)}
+META_ALPHABET = "-?abcefgjmopsxABCDEFGHIJKLMNOPQRSTUVWXYZNT"  # any meta char maps by index
+PARAM_LIST = tuple(sorted(KNOWN_PARAMS))
+CODE_VERSION = 4
+
+
+def _meta_byte(char):
+    return META_ALPHABET.index(char) if char in META_ALPHABET else 0
+
+
+SUPPORTED_FLAGS = ("a", "o", "m", "r")
+
+
+def _supported_bits(supported):
+    value = 0
+    for index, flag in enumerate(SUPPORTED_FLAGS):
+        if flag in (supported or ""):
+            value |= 1 << index
+    return value
+
+
+def _supported_text(value):
+    return "".join(flag if value & (1 << index) else "-" for index, flag in enumerate(SUPPORTED_FLAGS))
+
+
+def _rle(symbols):
+    """[(count, symbol), ...] with counts capped at 255."""
+    runs = []
+    for symbol in symbols:
+        if runs and runs[-1][1] == symbol and runs[-1][0] < 255:
+            runs[-1][0] += 1
+        else:
+            runs.append([1, symbol])
+    return runs
+
+
+# One byte per run: five bits of symbol (the vocabulary has 23 entries) and
+# three bits of length. Lengths 1-6 fit in that byte; 7 is an escape meaning a
+# full length byte follows, so one long uniform stretch costs two bytes instead
+# of one byte per eight cells. That matters because a healthy endpoint produces
+# long identical runs, and the code is retyped by hand.
+RUN_INLINE_MAX = 6
+RUN_ESCAPE = 7
+RUN_EXTENDED_MAX = 255
+
+
+def _pack_runs(runs):
+    out = bytearray()
+    for count, symbol in runs:
+        remaining = count
+        while remaining > 0:
+            if remaining <= RUN_INLINE_MAX:
+                out.append((symbol << 3) | remaining)
+                remaining = 0
+            else:
+                chunk = min(remaining, RUN_EXTENDED_MAX)
+                out.append((symbol << 3) | RUN_ESCAPE)
+                out.append(chunk)
+                remaining -= chunk
+    return bytes(out)
+
+
+def _unpack_runs(packed):
+    flat = []
+    index = 0
+    while index < len(packed):
+        byte = packed[index]
+        symbol, length = byte >> 3, byte & 0x07
+        index += 1
+        if length == RUN_ESCAPE:
+            length = packed[index]
+            index += 1
+        flat.extend([symbol] * length)
+    return flat
+
+
+def encode_payload(endpoints):
+    """endpoints: list of dicts with meta, supported, grid, params. -> bytes
+
+    The grid is run-length encoded first, because most cells repeat; that keeps
+    the relayed digit string short enough to retype by hand.
+    """
+    out = bytearray([CODE_VERSION, len(endpoints)])
+    for position, item in enumerate(endpoints):
+        # The first endpoint is the one under investigation and carries the full
+        # grid. Any later endpoint is a control, so only its per-path first-cell
+        # outcome is kept: that is what a comparison actually needs, and it keeps
+        # the relayed code short.
+        full = position == 0
+        out.append(1 if full else 0)
+        meta = (item["meta"] + "----")[:4]
+        out.extend(_meta_byte(character) for character in meta)
+        out.append(_supported_bits(item["supported"]))
+        if full:
+            flat = [VOCAB_INDEX.get(cell, VOCAB_INDEX["?"]) for row in item["grid"] for cell in row]
+        else:
+            flat = [VOCAB_INDEX.get(row[0] if row else "-", VOCAB_INDEX["?"]) for row in item["grid"]]
+        packed = _pack_runs(_rle(flat))
+        out.append(len(packed))
+        out.extend(packed)
+        names = [name for name in item["params"] if name in PARAM_LIST][:3]
+        out.append(len(names))
+        out.extend(PARAM_LIST.index(name) for name in names)
+    return bytes(out)
+
+
+def _deflate(payload):
+    import zlib
+
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return compressor.compress(payload) + compressor.flush()
+
+
+def _inflate(blob):
+    import zlib
+
+    return zlib.decompress(blob, -15)
+
+
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def result_code(payload):
+    """Compress and render as uppercase letters, grouped in fours.
+
+    Letters carry 26 values per character instead of a digit's 10, so the code
+    a human has to copy is roughly 40% shorter than the decimal form, with no
+    digit-versus-letter ambiguity. Raw deflate (no zlib header) shortens it
+    further; the smaller of compressed and raw wins, flagged by a marker byte.
+    Two trailing check letters catch a mistyped character.
+    """
+    blob = _deflate(payload)
+    if len(blob) < len(payload):
+        marker, body = b"\x02", blob
+    else:
+        marker, body = b"\x03", payload
+    number = int.from_bytes(marker + body, "big")
+    letters = ""
+    while number:
+        number, remainder = divmod(number, 26)
+        letters = ALPHABET[remainder] + letters
+    letters = letters or ALPHABET[0]
+    total = sum(ALPHABET.index(character) for character in letters)
+    letters += ALPHABET[(total // 26) % 26] + ALPHABET[total % 26]
+    return " ".join(letters[index:index + 4] for index in range(0, len(letters), 4))
+
+
+def decode_code(code):
+    """Inverse of result_code plus encode_payload. Used by --decode."""
+    letters = "".join(character for character in code.upper() if character in ALPHABET)
+    if len(letters) < 4:
+        raise ValueError("code too short")
+    body, check = letters[:-2], letters[-2:]
+    total = sum(ALPHABET.index(character) for character in body)
+    if ALPHABET[(total // 26) % 26] + ALPHABET[total % 26] != check:
+        raise ValueError("check letters do not match - the code was mistyped")
+    number = 0
+    for character in body:
+        number = number * 26 + ALPHABET.index(character)
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    marker, rest = raw[0], raw[1:]
+    if marker == 2:
+        payload = _inflate(rest)
+    elif marker == 3:
+        payload = rest
+    else:
+        raise ValueError("unknown code marker")
+    cursor = 0
+    version, count = payload[cursor], payload[cursor + 1]
+    cursor += 2
+    result = {"version": version, "endpoints": []}
+    for _ in range(count):
+        full = payload[cursor] == 1
+        cursor += 1
+        meta = "".join(META_ALPHABET[byte] for byte in payload[cursor:cursor + 4])
+        cursor += 4
+        supported = _supported_text(payload[cursor])
+        cursor += 1
+        packed_length = payload[cursor]
+        cursor += 1
+        flat = [VOCAB[symbol] for symbol in _unpack_runs(payload[cursor:cursor + packed_length])]
+        cursor += packed_length
+        if full:
+            width = len(CELL_LABELS)
+            grid = [flat[index:index + width] for index in range(0, len(flat), width)]
+        else:
+            grid = [[cell] for cell in flat]
+        name_count = payload[cursor]
+        cursor += 1
+        names = [PARAM_LIST[byte] for byte in payload[cursor:cursor + name_count]]
+        cursor += name_count
+        result["endpoints"].append({"meta": meta, "supported": supported, "full": full,
+                                    "grid": grid, "params": names})
+    return result
+
+
+def render_table(endpoints):
+    """Human-readable table for the screen only; never relayed."""
+    lines = []
+    for item in endpoints:
+        lines.append("endpoint {}  meta={}  supported={}".format(item["label"], item["meta"], item["supported"]))
+        header = "     " + " ".join("{:>3d}".format(index) for index in range(1, len(CELL_LABELS) + 1))
+        lines.append(header)
+        for (letter, _template, _kind), row in zip(PATHS, item["grid"]):
+            lines.append("  {}  ".format(letter) + " ".join("{:>3}".format(cell) for cell in row))
+        if item["params"]:
+            lines.append("  rejected parameters: " + ", ".join(item["params"]))
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------- probe
 
 
 def probe_endpoint(opener, host, token, endpoint, dump, verbose, only):
+    """Return a dict: meta, supported, grid (one row per path), params."""
     meta, supported = metadata(opener, host, token, endpoint, dump)
-    rejected, digests, path_codes = [], [], []
+    rejected, grid = [], []
 
     for letter, template, kind in PATHS:
         if only and letter not in only:
+            grid.append(["-"] * len(CELL_LABELS))
             continue
         path = template.replace("{name}", urllib.parse.quote(endpoint))
         try:
@@ -478,7 +702,7 @@ def probe_endpoint(opener, host, token, endpoint, dump, verbose, only):
         except Exception:
             if verbose:
                 traceback.print_exc()
-            path_codes.append(letter + "=" + ".".join(["X1"] * len(CELL_LABELS)))
+            grid.append(["X1"] * len(CELL_LABELS))
             continue
 
         cells = []
@@ -501,36 +725,28 @@ def probe_endpoint(opener, host, token, endpoint, dump, verbose, only):
             cells.append(cell)
             if named and named not in rejected:
                 rejected.append(named)
-            if cell.startswith("4") or cell in ("?", "5"):
-                digest = hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:4]
-                if digest not in digests:
-                    digests.append(digest)
             if verbose:
                 sys.stderr.write("  {}{:02d} {:<8} -> {}\n".format(letter, index, label, cell))
             if index == 1 and cell in ("N", "A", "T"):
                 cells.extend(["-"] * (len(CELL_LABELS) - 1))
                 break
-        path_codes.append(letter + "=" + ".".join(cells))
+        while len(cells) < len(CELL_LABELS):
+            cells.append("-")
+        grid.append(cells[:len(CELL_LABELS)])
 
-    parts = ["M=" + meta]
-    if supported:
-        joined = " ".join(supported).lower()
-        parts.append("S=" + "".join([
-            "a" if "anthropic" in joined else "-",
-            "o" if ("openai" in joined and "responses" not in joined) else "-",
-            "m" if ("mlflow" in joined and "responses" not in joined) else "-",
-            "r" if "responses" in joined else "-",
-        ]))
-    parts.extend(path_codes)
-    if rejected:
-        parts.append("R=" + ",".join(rejected[:4]))
-    if digests:
-        parts.append("H=" + ",".join(digests[:5]))
-    return "/".join(parts)
+    joined = " ".join(supported).lower()
+    supported_code = "".join([
+        "a" if "anthropic" in joined else "-",
+        "o" if ("openai" in joined and "responses" not in joined) else "-",
+        "m" if ("mlflow" in joined and "responses" not in joined) else "-",
+        "r" if "responses" in joined else "-",
+    ]) if supported else "----"
+
+    return {"meta": meta, "supported": supported_code, "grid": grid, "params": rejected[:3]}
 
 
 LEGEND = """
---- legend (no need to relay this) -------------------------------------------
+--- legend (for your screen only; do NOT relay any of this) ------------------
 Cells, in order: 01 min 02 sys 03 tools-openai 04 tools-flat 05 tools-anthropic
   06 tools-empty 07 tool_choice-auto 08 tool_choice-forced 09 tool_choice-none
   10 parallel-off 11 reasoning+tools 12 max_completion_tokens 13 stream+tools
@@ -542,9 +758,10 @@ Status: 2 ok | 4x bad-request | N not-found | A auth | R rate | P too-large
         5 upstream | T transport | ? unclassified | - skipped | X# SCRIPT FAULT
 4x letter: t tools c tool_choice p parallel r reasoning m max-tokens s stream
            n tool-message j schema b unsupported-combination v generic o other
-M=<type><task><entity><gateway>  S=<anthropic><openai><mlflow><responses>
-R=rejected parameter names   H=distinct error fingerprints
-Only a line starting with V4# is a result. FAIL# means the probe itself broke.
+meta=<type><task><entity><gateway>  supported=<anthropic><openai><mlflow><responses>
+
+RELAY ONLY THE LETTERS printed under RESULT CODE - nothing else.
+If the script itself breaks it prints FAILCODE instead, which is not a result.
 ------------------------------------------------------------------------------
 """
 
@@ -650,6 +867,81 @@ def selftest():
     except Exception as error:
         check("responses body shape checks", False, repr(error))
 
+    # digits-only code: round trip, charset, and realistic length
+    typical = []
+    for label in ("P", "Q"):
+        grid = []
+        for letter, _template, _kind in PATHS:
+            if letter in ("G", "H"):
+                grid.append(["N"] + ["-"] * (len(CELL_LABELS) - 1))
+            elif letter in ("B", "E"):
+                grid.append(["2", "2", "4t", "4t", "2", "2", "2", "2", "2", "2",
+                             "2", "4m", "2", "4s", "2", "2", "2", "2", "2", "2"])
+            else:
+                grid.append(["2"] * len(CELL_LABELS))
+        typical.append({"label": label, "meta": "fcfg", "supported": "a-m-",
+                        "grid": grid, "params": ["tools", "max_tokens"]})
+    try:
+        code = result_code(encode_payload(typical))
+        compact = code.replace(" ", "")
+        back = decode_code(code)
+        check("code is uppercase letters and spaces only",
+              all(character in ALPHABET or character == " " for character in code), repr(code[:20]))
+        check("primary grid round trips losslessly",
+              back["endpoints"][0]["grid"] == typical[0]["grid"]
+              and back["endpoints"][0]["meta"] == typical[0]["meta"]
+              and back["endpoints"][0]["supported"] == typical[0]["supported"]
+              and back["endpoints"][0]["params"] == typical[0]["params"])
+        check("control keeps per-path first outcome",
+              [row[0] for row in back["endpoints"][1]["grid"]] == [row[0] for row in typical[1]["grid"]])
+        # Measured bounds, kept as regression guards with headroom: a change
+        # that makes the relayed code materially longer should fail here.
+        check("typical code stays under 80 letters", len(compact) <= 80, "len={}".format(len(compact)))
+        print("    typical code: {} letters -> {}".format(len(compact), code))
+        swapped = ALPHABET[(ALPHABET.index(compact[2]) + 1) % 26]
+        mistyped = compact[:2] + swapped + compact[3:]
+        bad = False
+        try:
+            decode_code(mistyped)
+        except Exception:
+            bad = True
+        check("single mistyped letter is detected", bad)
+        check("lowercase input still decodes",
+              decode_code(code.lower())["endpoints"][0]["grid"] == typical[0]["grid"])
+        check("spaces are optional",
+              decode_code(compact)["endpoints"][0]["grid"] == typical[0]["grid"])
+    except Exception as error:
+        check("letter code round trip", False, repr(error))
+        traceback.print_exc()
+
+    worst = [{"label": "P", "meta": "fcfg", "supported": "aomr",
+              "grid": [[VOCAB[(row * 7 + col) % len(VOCAB)] for col in range(len(CELL_LABELS))]
+                       for row in range(len(PATHS))],
+              "params": ["tools", "tool_choice", "max_tokens"]} for _ in (0, 1)]
+    try:
+        worst_code = result_code(encode_payload(worst)).replace(" ", "")
+        print("    worst-case code: {} letters".format(len(worst_code)))
+        check("worst-case code stays under 160 letters", len(worst_code) <= 160, "len={}".format(len(worst_code)))
+        uniform = [{"label": "P", "meta": "fcfg", "supported": "a-m-",
+                    "grid": [["2"] * len(CELL_LABELS) for _ in PATHS], "params": []},
+                   {"label": "Q", "meta": "fcfg", "supported": "a-m-",
+                    "grid": [["2"] * len(CELL_LABELS) for _ in PATHS], "params": []}]
+        best = result_code(encode_payload(uniform)).replace(" ", "")
+        print("    all-pass code: {} letters".format(len(best)))
+        check("all-pass code stays under 45 letters", len(best) <= 45, "len={}".format(len(best)))
+        for name, grid_source in (("uniform", uniform), ("typical", typical), ("worst", worst)):
+            restored = decode_code(result_code(encode_payload(grid_source)))
+            check("run packing round trips: " + name,
+                  restored["endpoints"][0]["grid"] == grid_source[0]["grid"])
+    except Exception as error:
+        check("worst-case encode", False, repr(error))
+
+    check("vocab covers every classifier output",
+          all(classify(status, text)[0] in VOCAB_INDEX
+              for status, text in ((200, ""), (400, "Rejected parameter: tools"), (404, ""),
+                                  (401, ""), (429, ""), (413, ""), (500, ""), (0, "x"),
+                                  (400, "odd"), (418, "t"))))
+    check("vocab has script-fault codes", all(code in VOCAB_INDEX for code in ("X1", "X2", "X3")))
     check("paths unique letters", len({p[0] for p in PATHS}) == len(PATHS))
     check("paths use known kinds", all(p[2] in KINDS for p in PATHS))
     check("cell label count is 20", len(CELL_LABELS) == 20)
@@ -680,21 +972,24 @@ def run(args):
     opener = make_opener(args.insecure)
     dump = [] if args.dump else None
 
-    codes = []
+    endpoints = []
     for label, endpoint in (("P", args.endpoint), ("Q", args.control)):
         if not endpoint:
             continue
         if args.verbose:
             sys.stderr.write("probing {} ...\n".format(label))
-        codes.append(label + "|" + probe_endpoint(opener, host, token, endpoint, dump, args.verbose, only))
+        item = probe_endpoint(opener, host, token, endpoint, dump, args.verbose, only)
+        item["label"] = label
+        endpoints.append(item)
 
     if dump is not None:
         with open(args.dump, "w", encoding="utf-8") as handle:
             json.dump(dump, handle, indent=2)
         sys.stderr.write("local transcript: {} (keep it on this machine)\n".format(args.dump))
 
+    sys.stderr.write("\n" + render_table(endpoints))
     sys.stderr.write(LEGEND)
-    return VERSION + "#" + "#".join(codes)
+    return result_code(encode_payload(endpoints))
 
 
 def main():
@@ -708,19 +1003,26 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="per-cell progress on stderr")
     parser.add_argument("--only", default="", help="restrict to paths, e.g. A,C,E")
     parser.add_argument("--selftest", action="store_true", help="offline logic check, no network")
+    parser.add_argument("--decode", default="", help="decode a previously printed digits code")
     args = parser.parse_args()
 
     if args.selftest:
         return selftest()
-    try:
-        print(run(args))
+    if args.decode:
+        print(json.dumps(decode_code(args.decode), indent=2))
         return 0
+    try:
+        code = run(args)
     except SystemExit:
         raise
     except Exception:
         traceback.print_exc()
-        print("FAIL#probe-error")
+        print("\n=== RESULT CODE ===")
+        print("FAILCODE")
         return 3
+    print("\n=== RESULT CODE (letters only - relay exactly this) ===")
+    print(code)
+    return 0
 
 
 if __name__ == "__main__":
