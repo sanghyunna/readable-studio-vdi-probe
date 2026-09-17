@@ -18,7 +18,7 @@ SCRIPT FAILURE vs RESULT
 
 USAGE
     python test.py --selftest
-    python test.py --endpoint system.ai.databricks-claude-sonnet-5 \
+    python test.py --endpoint system.ai.claude-sonnet-5 \
                    --control system.ai.gpt-oss-120b
 
 CREDENTIALS (first match wins; you are prompted otherwise)
@@ -1080,7 +1080,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Databricks tools-rejection probe (v4)")
-    parser.add_argument("--endpoint", default="system.ai.databricks-claude-sonnet-5")
+    parser.add_argument("--endpoint", default="system.ai.claude-sonnet-5")
     parser.add_argument("--control", default="", help="endpoint known to work, e.g. system.ai.gpt-oss-120b")
     parser.add_argument("--host", default=os.environ.get("DATABRICKS_HOST", ""))
     parser.add_argument("--token", default=os.environ.get("DATABRICKS_TOKEN", ""))
