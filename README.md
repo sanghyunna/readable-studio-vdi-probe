@@ -52,3 +52,18 @@ declared supported APIs, plus any parameter name the server names as rejected.
 
 That isolates whether the rejection is the path, the tool envelope shape, one
 specific parameter, or the combination - in a single run.
+
+## Finding the endpoint name
+
+A Unity Catalog model name such as `system.ai.<model>` is not necessarily the
+serving-endpoint name, so probing it can return 404 on every path including the
+metadata API. That means no endpoint carries that name - not that the model
+rejects tools.
+
+The probe now lists the endpoints the token can see, matches the requested name
+against them, and probes the resolved name, so one run still answers the
+question. The relayed code records how the name was obtained (exact, resolved,
+ambiguous, or unlistable) and how many endpoints were visible, so a wrong-name
+run can never be mistaken for a working endpoint that rejects tools.
+
+Run `python test.py --list` to print the visible endpoint names on screen.

@@ -412,6 +412,59 @@ PATHS = (
 # -------------------------------------------------------------------- metadata
 
 
+def list_endpoints(opener, host, token, dump):
+    """Return (status, [(name, task, endpoint_type), ...]). Never raises."""
+    names = []
+    status, text = call(opener, host, token, "/api/2.0/serving-endpoints")
+    record(dump, "list", "/api/2.0/serving-endpoints", status, text)
+    if status != 200:
+        return status, names
+    try:
+        data = json.loads(text)
+    except Exception:
+        return status, names
+    for item in (data.get("endpoints") or []):
+        if isinstance(item, dict) and item.get("name"):
+            names.append((str(item["name"]), str(item.get("task") or ""), str(item.get("endpoint_type") or "")))
+    return status, names
+
+
+def resolve_endpoint(opener, host, token, requested, dump, verbose):
+    """If the requested name is absent, find the real serving-endpoint name.
+
+    A Unity Catalog model name such as system.ai.<model> is not necessarily the
+    serving-endpoint name, so a 404 on the metadata API means 'no endpoint by
+    that name' rather than 'no such model'. Listing the workspace's endpoints
+    and matching on the requested name's distinctive parts avoids a second
+    blind run.
+    """
+    status, _text = call(opener, host, token,
+                         "/api/2.0/serving-endpoints/" + urllib.parse.quote(requested))
+    if status == 200:
+        return requested, "exact", []
+    list_status, names = list_endpoints(opener, host, token, dump)
+    if list_status != 200 or not names:
+        return requested, "list-failed:{}".format(list_status), names
+
+    tail = requested.split(".")[-1].lower()
+    words = [word for word in re.split(r"[^a-z0-9]+", tail) if len(word) > 2]
+    scored = []
+    for name, task, etype in names:
+        low = name.lower()
+        score = sum(1 for word in words if word in low)
+        if low == tail:
+            score += 5
+        if score:
+            scored.append((score, name, task, etype))
+    scored.sort(reverse=True)
+    if verbose:
+        for score, name, task, etype in scored[:10]:
+            sys.stderr.write("  candidate {} score={} task={} type={}\n".format(name, score, task, etype))
+    if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+        return scored[0][1], "resolved", names
+    return requested, "ambiguous", names
+
+
 def metadata(opener, host, token, endpoint, dump):
     """Return (4-char code, supported-api list). Never raises."""
     status, text = call(opener, host, token,
@@ -484,6 +537,10 @@ def _meta_byte(char):
 
 
 SUPPORTED_FLAGS = ("a", "o", "m", "r")
+
+# How the probed endpoint name was obtained. Recorded so a run against the
+# wrong name can never be mistaken for a working endpoint that rejects tools.
+RESOLUTIONS = ("exact", "resolved", "ambiguous", "list-failed", "unknown")
 
 
 def _supported_bits(supported):
@@ -576,6 +633,9 @@ def encode_payload(endpoints):
         names = [name for name in item["params"] if name in PARAM_LIST][:3]
         out.append(len(names))
         out.extend(PARAM_LIST.index(name) for name in names)
+        out.append(RESOLUTIONS.index(item.get("resolution", "exact"))
+                   if item.get("resolution", "exact") in RESOLUTIONS else len(RESOLUTIONS) - 1)
+        out.append(min(item.get("visible", 0), 255))
     return bytes(out)
 
 
@@ -664,8 +724,12 @@ def decode_code(code):
         cursor += 1
         names = [PARAM_LIST[byte] for byte in payload[cursor:cursor + name_count]]
         cursor += name_count
+        resolution = RESOLUTIONS[payload[cursor]] if payload[cursor] < len(RESOLUTIONS) else "unknown"
+        visible = payload[cursor + 1]
+        cursor += 2
         result["endpoints"].append({"meta": meta, "supported": supported, "full": full,
-                                    "grid": grid, "params": names})
+                                    "grid": grid, "params": names,
+                                    "resolution": resolution, "visible": visible})
     return result
 
 
@@ -673,7 +737,9 @@ def render_table(endpoints):
     """Human-readable table for the screen only; never relayed."""
     lines = []
     for item in endpoints:
-        lines.append("endpoint {}  meta={}  supported={}".format(item["label"], item["meta"], item["supported"]))
+        lines.append("endpoint {}  meta={}  supported={}  name={}  visible={}".format(
+            item["label"], item["meta"], item["supported"],
+            item.get("resolution", "exact"), item.get("visible", 0)))
         header = "     " + " ".join("{:>3d}".format(index) for index in range(1, len(CELL_LABELS) + 1))
         lines.append(header)
         for (letter, _template, _kind), row in zip(PATHS, item["grid"]):
@@ -879,8 +945,8 @@ def selftest():
                              "2", "4m", "2", "4s", "2", "2", "2", "2", "2", "2"])
             else:
                 grid.append(["2"] * len(CELL_LABELS))
-        typical.append({"label": label, "meta": "fcfg", "supported": "a-m-",
-                        "grid": grid, "params": ["tools", "max_tokens"]})
+        typical.append({"label": label, "meta": "fcfg", "supported": "a-m-", "grid": grid,
+                        "params": ["tools", "max_tokens"], "resolution": "resolved", "visible": 12})
     try:
         code = result_code(encode_payload(typical))
         compact = code.replace(" ", "")
@@ -891,7 +957,9 @@ def selftest():
               back["endpoints"][0]["grid"] == typical[0]["grid"]
               and back["endpoints"][0]["meta"] == typical[0]["meta"]
               and back["endpoints"][0]["supported"] == typical[0]["supported"]
-              and back["endpoints"][0]["params"] == typical[0]["params"])
+              and back["endpoints"][0]["params"] == typical[0]["params"]
+              and back["endpoints"][0]["resolution"] == "resolved"
+              and back["endpoints"][0]["visible"] == 12)
         check("control keeps per-path first outcome",
               [row[0] for row in back["endpoints"][1]["grid"]] == [row[0] for row in typical[1]["grid"]])
         # Measured bounds, kept as regression guards with headroom: a change
@@ -917,7 +985,8 @@ def selftest():
     worst = [{"label": "P", "meta": "fcfg", "supported": "aomr",
               "grid": [[VOCAB[(row * 7 + col) % len(VOCAB)] for col in range(len(CELL_LABELS))]
                        for row in range(len(PATHS))],
-              "params": ["tools", "tool_choice", "max_tokens"]} for _ in (0, 1)]
+              "params": ["tools", "tool_choice", "max_tokens"],
+              "resolution": "exact", "visible": 200} for _ in (0, 1)]
     try:
         worst_code = result_code(encode_payload(worst)).replace(" ", "")
         print("    worst-case code: {} letters".format(len(worst_code)))
@@ -926,6 +995,7 @@ def selftest():
                     "grid": [["2"] * len(CELL_LABELS) for _ in PATHS], "params": []},
                    {"label": "Q", "meta": "fcfg", "supported": "a-m-",
                     "grid": [["2"] * len(CELL_LABELS) for _ in PATHS], "params": []}]
+        check("resolution vocabulary is stable", RESOLUTIONS[0] == "exact" and len(RESOLUTIONS) == 5)
         best = result_code(encode_payload(uniform)).replace(" ", "")
         print("    all-pass code: {} letters".format(len(best)))
         check("all-pass code stays under 45 letters", len(best) <= 45, "len={}".format(len(best)))
@@ -972,14 +1042,30 @@ def run(args):
     opener = make_opener(args.insecure)
     dump = [] if args.dump else None
 
+    if args.list:
+        status, names = list_endpoints(opener, host, token, dump)
+        sys.stderr.write("\nserving endpoints visible to this token (status {}):\n".format(status))
+        for name, task, etype in names:
+            sys.stderr.write("  {:<52} task={:<16} type={}\n".format(name, task, etype))
+        sys.stderr.write("\n{} endpoint(s). Re-run with --endpoint <name> from this list.\n".format(len(names)))
+        return "LIST"
+
     endpoints = []
-    for label, endpoint in (("P", args.endpoint), ("Q", args.control)):
-        if not endpoint:
+    for label, requested in (("P", args.endpoint), ("Q", args.control)):
+        if not requested:
             continue
+        endpoint, how, names = resolve_endpoint(opener, host, token, requested, dump, args.verbose)
+        if how != "exact":
+            sys.stderr.write("{}: requested {!r} not found directly ({}); using {!r}\n".format(
+                label, requested, how, endpoint))
+            if names and args.verbose:
+                sys.stderr.write("  {} endpoints visible; run --list to see them\n".format(len(names)))
         if args.verbose:
             sys.stderr.write("probing {} ...\n".format(label))
         item = probe_endpoint(opener, host, token, endpoint, dump, args.verbose, only)
         item["label"] = label
+        item["resolution"] = how
+        item["visible"] = len(names)
         endpoints.append(item)
 
     if dump is not None:
@@ -1003,7 +1089,9 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="per-cell progress on stderr")
     parser.add_argument("--only", default="", help="restrict to paths, e.g. A,C,E")
     parser.add_argument("--selftest", action="store_true", help="offline logic check, no network")
-    parser.add_argument("--decode", default="", help="decode a previously printed digits code")
+    parser.add_argument("--decode", default="", help="decode a previously printed result code")
+    parser.add_argument("--list", action="store_true",
+                        help="list the serving endpoints this token can see, then exit")
     args = parser.parse_args()
 
     if args.selftest:
