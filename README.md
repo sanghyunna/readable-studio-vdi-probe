@@ -1,3 +1,6 @@
+<img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/4ff43897-ed96-43bb-b92b-2522d09d7704" />
+
+
 # readable-studio-vdi-probe
 
 Read-only diagnostic for a Databricks serving endpoint that rejects tool calls.
